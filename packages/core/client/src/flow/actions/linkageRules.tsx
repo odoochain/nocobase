@@ -40,7 +40,7 @@ import { FilterGroup } from '../components/filter/FilterGroup';
 import { LinkageFilterItem } from '../components/filter';
 import { CodeEditor } from '../components/code-editor';
 import { FieldAssignRulesEditor } from '../components/FieldAssignRulesEditor';
-import type { FieldAssignRuleItem } from '../components/FieldAssignRulesEditor';
+import type { AssignMode, FieldAssignRuleItem } from '../components/FieldAssignRulesEditor';
 import { collectFieldAssignCascaderOptions } from '../components/fieldAssignOptions';
 import { useAssociationTitleFieldSync } from '../components/useAssociationTitleFieldSync';
 import _ from 'lodash';
@@ -841,6 +841,20 @@ type ArrayFieldComponentProps = {
 
 const LEGACY_ASSIGN_RULE = { mode: 'assign', valueKey: 'assignValue' } as const;
 const LEGACY_DEFAULT_RULE = { mode: 'default', valueKey: 'initialValue' } as const;
+const LINKAGE_ASSIGN_MODE_PROP = '__linkageAssignMode';
+
+function normalizeLinkageAssignMode(mode: unknown): AssignMode {
+  if (mode === 'default') return 'default';
+  if (mode === 'override') return 'override';
+  return 'assign';
+}
+
+type LinkageValuePatch = {
+  path: Array<string | number>;
+  value: unknown;
+  whenEmpty?: boolean;
+  mode?: AssignMode;
+};
 
 const FieldAssignRulesActionComponent: React.FC<
   ArrayFieldComponentProps & {
@@ -955,16 +969,24 @@ export const linkageAssignField = defineAction({
           continue;
         }
 
-        const mode = it?.mode === 'default' ? 'default' : 'assign';
+        const mode = normalizeLinkageAssignMode(it?.mode);
         if (fieldModel) {
           if (mode === 'default') {
             setProps(fieldModel as FlowModel, { initialValue: finalValue });
           } else {
-            setProps(fieldModel as FlowModel, { value: finalValue });
+            setProps(fieldModel as FlowModel, {
+              value: finalValue,
+              ...(mode === 'override' ? { [LINKAGE_ASSIGN_MODE_PROP]: mode } : {}),
+            });
           }
         } else if (typeof addFormValuePatch === 'function') {
           // 对关联字段子属性（如 user.name）等没有独立 FormItemModel 的目标，直接写入表单值
-          addFormValuePatch({ path: targetPath, value: finalValue, whenEmpty: mode === 'default' });
+          addFormValuePatch({
+            path: targetPath,
+            value: finalValue,
+            whenEmpty: mode === 'default',
+            ...(mode === 'override' ? { mode } : {}),
+          });
         }
       }
     } catch (error) {
@@ -1130,7 +1152,7 @@ export const subFormLinkageAssignField = defineAction({
           continue;
         }
 
-        const mode = it?.mode === 'default' ? 'default' : 'assign';
+        const mode = normalizeLinkageAssignMode(it?.mode);
         const actionName = (ctx.model as any)?.getAclActionName?.() ?? (ctx.model as any)?.context?.actionName;
         const isEditForm = actionName === 'update';
         const isNewItem = (ctx as any)?.item?.__is_new__ === true;
@@ -1160,12 +1182,21 @@ export const subFormLinkageAssignField = defineAction({
           continue;
         }
 
+        if (mode === 'override' && hasExplicitPathHit(targetPath)) {
+          continue;
+        }
+
         if (!fieldUid) {
           if (mode === 'default' && hasExplicitPathHit(targetPath)) {
             continue;
           }
           if (typeof addFormValuePatch === 'function') {
-            addFormValuePatch({ path: targetPath, value: finalValue, whenEmpty: mode === 'default' });
+            addFormValuePatch({
+              path: targetPath,
+              value: finalValue,
+              whenEmpty: mode === 'default',
+              ...(mode === 'override' ? { mode } : {}),
+            });
           }
           continue;
         }
@@ -1176,7 +1207,10 @@ export const subFormLinkageAssignField = defineAction({
         if (mode === 'default') {
           setProps(model, { initialValue: finalValue });
         } else {
-          setProps(model, { value: finalValue });
+          setProps(model, {
+            value: finalValue,
+            ...(mode === 'override' ? { [LINKAGE_ASSIGN_MODE_PROP]: mode } : {}),
+          });
         }
       }
     } catch (error) {
@@ -1730,7 +1764,7 @@ const commonLinkageRulesHandler = async (ctx: FlowContext, params: any) => {
   const allModels: FlowModel[] = ctx.model.__allModels || (ctx.model.__allModels = []);
   const modelsToApply = new Set<FlowModel>(allModels);
   const patchPropsByModel = new Map<FlowModel, any>();
-  const directValuePatches: Array<{ path: Array<string | number>; value: any; whenEmpty?: boolean }> = [];
+  const directValuePatches: LinkageValuePatch[] = [];
   const rootCollection = getCollectionFromModel((ctx.model as any)?.context?.blockModel ?? ctx.model);
   const isSafeToWriteAssociationSubpath = (namePath: any): boolean => {
     if (!Array.isArray(namePath) || !namePath.length) return true;
@@ -1785,13 +1819,18 @@ const commonLinkageRulesHandler = async (ctx: FlowContext, params: any) => {
     }
 
     for (const patch of lastPatchByPathKey.values()) {
-      if (!patch.whenEmpty) continue;
+      if (!patch.whenEmpty && patch.mode !== 'default') continue;
       runtime.recordDefaultValuePatch(patch.path, patch.value);
     }
   };
-  const addFormValuePatch = (patch: { path: any; value: any; whenEmpty?: boolean }) => {
+  const getPatchMode = (patch: { mode?: unknown; whenEmpty?: boolean }): AssignMode => {
+    if (patch?.mode === 'default') return 'default';
+    if (patch?.mode === 'override') return 'override';
+    return patch?.whenEmpty ? 'default' : 'assign';
+  };
+  const addFormValuePatch = (patch: { path: unknown; value: unknown; whenEmpty?: boolean; mode?: AssignMode }) => {
     if (!patch) return;
-    const path = (patch as any)?.path;
+    const path = patch.path;
     if (!path) return;
     const resolvedPath = resolveNamePathForPatch(path);
     if (!resolvedPath) {
@@ -1811,8 +1850,9 @@ const commonLinkageRulesHandler = async (ctx: FlowContext, params: any) => {
       });
       return;
     }
-    const whenEmpty = !!(patch as any)?.whenEmpty;
-    const value = (patch as any)?.value;
+    const mode = getPatchMode(patch);
+    const whenEmpty = mode === 'default';
+    const value = patch.value;
     try {
       const form = ctx.model?.context?.form;
       const current = form?.getFieldValue?.(resolvedPath);
@@ -1827,6 +1867,15 @@ const commonLinkageRulesHandler = async (ctx: FlowContext, params: any) => {
           return;
         }
       }
+      if (mode === 'override') {
+        const runtime = getDefaultPatchRuntime();
+        if (
+          typeof runtime?.canApplyOverrideValuePatch === 'function' &&
+          !runtime.canApplyOverrideValuePatch(resolvedPath)
+        ) {
+          return;
+        }
+      }
       if (_.isEqual(current, value)) {
         return;
       }
@@ -1838,6 +1887,7 @@ const commonLinkageRulesHandler = async (ctx: FlowContext, params: any) => {
       path: resolvedPath,
       value,
       ...(whenEmpty ? { whenEmpty: true } : {}),
+      ...(mode === 'override' ? { mode } : {}),
     });
   };
 
@@ -1890,6 +1940,14 @@ const commonLinkageRulesHandler = async (ctx: FlowContext, params: any) => {
 
     for (const action of actions) {
       const setProps = (model: FlowModel & { __originalProps?: any; __shouldReset?: boolean }, props: any) => {
+        const normalizedProps =
+          props && typeof props === 'object' && Object.prototype.hasOwnProperty.call(props, 'value')
+            ? {
+                ...props,
+                [LINKAGE_ASSIGN_MODE_PROP]: normalizeLinkageAssignMode(props?.[LINKAGE_ASSIGN_MODE_PROP]),
+              }
+            : props;
+
         // 存储原始值，用于恢复
         if (!model.__originalProps) {
           model.__originalProps = {
@@ -1905,7 +1963,7 @@ const commonLinkageRulesHandler = async (ctx: FlowContext, params: any) => {
         // 临时存起来，遍历完所有规则后，再统一处理
         patchPropsByModel.set(model, {
           ...(patchPropsByModel.get(model) || {}),
-          ...props,
+          ...normalizedProps,
         });
 
         if (allModels.indexOf(model) === -1) {
@@ -1949,7 +2007,7 @@ const commonLinkageRulesHandler = async (ctx: FlowContext, params: any) => {
     const patchProps = mergedPropsByUid.get(uid) || {};
     const newProps = { ...model.__originalProps, ...patchProps };
 
-    model.setProps(_.omit(newProps, ['hiddenModel', 'value', 'hiddenText']));
+    model.setProps(_.omit(newProps, ['hiddenModel', 'value', 'hiddenText', LINKAGE_ASSIGN_MODE_PROP]));
     syncFieldOptionsToForks(model, patchProps);
     model.hidden = !!newProps.hiddenModel;
 
@@ -1981,7 +2039,8 @@ const commonLinkageRulesHandler = async (ctx: FlowContext, params: any) => {
           targetUid: model?.uid,
         });
       } else {
-        addFormValuePatch({ path: targetPath, value: newProps.value });
+        const mode = normalizeLinkageAssignMode(patchProps?.[LINKAGE_ASSIGN_MODE_PROP]);
+        addFormValuePatch({ path: targetPath, value: newProps.value, ...(mode === 'override' ? { mode } : {}) });
       }
     }
 
