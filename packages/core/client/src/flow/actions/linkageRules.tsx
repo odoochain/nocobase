@@ -46,6 +46,7 @@ import { useAssociationTitleFieldSync } from '../components/useAssociationTitleF
 import _ from 'lodash';
 import { SubFormFieldModel, SubFormListFieldModel } from '../models';
 import { coerceForToOneField } from '../internal/utils/associationValueCoercion';
+import { enumToOptions } from '../internal/utils/enumOptionsUtils';
 import {
   findFormItemModelByFieldPath,
   getCollectionFromModel,
@@ -118,6 +119,214 @@ const getFormFields = (ctx: any) => {
     console.warn('Failed to get form fields:', error);
     return [];
   }
+};
+
+const cloneOptions = (options: any[]) =>
+  options.map((option) => (option && typeof option === 'object' ? { ...option } : option));
+
+const LIMIT_OPTIONS_INTERFACES = new Set(['select', 'multipleSelect', 'radioGroup', 'checkboxGroup']);
+
+const getFieldInterface = (fieldModel: any) => {
+  return fieldModel?.collectionField?.interface || fieldModel?.subModels?.field?.context?.collectionField?.interface;
+};
+
+const supportsLimitOptions = (fieldModel: any) => {
+  return LIMIT_OPTIONS_INTERFACES.has(getFieldInterface(fieldModel));
+};
+
+const getOriginalFieldOptions = (fieldModel: any) => {
+  const field = fieldModel?.subModels?.field || fieldModel;
+  const enumOptions = enumToOptions(fieldModel?.collectionField?.uiSchema?.enum, (text) => text) || [];
+  if (enumOptions.length > 0) {
+    field._originalOptionsFallback = cloneOptions(enumOptions);
+    return field._originalOptionsFallback;
+  }
+  if (Array.isArray(field?._originalOptionsFallback) && field._originalOptionsFallback.length > 0) {
+    return field._originalOptionsFallback;
+  }
+  if (Array.isArray(field?.props?.options) && field.props.options.length > 0) {
+    field._originalOptionsFallback = cloneOptions(field.props.options);
+    return field._originalOptionsFallback;
+  }
+  return null;
+};
+
+const getFieldModelOptions = (fieldModel: any, t: (s: string) => string) => {
+  const originalOptions = getOriginalFieldOptions(fieldModel);
+  if (originalOptions) {
+    return originalOptions.map((option: any) =>
+      option && typeof option === 'object' && typeof option.label === 'string'
+        ? { ...option, label: t(option.label) }
+        : option,
+    );
+  }
+  return [];
+};
+
+const getFieldOptionsBySelectedFields = (fieldOptions: any[], fields: string[] = [], t: (s: string) => string) => {
+  const selected = fields
+    .map((fieldUid) => fieldOptions.find((option) => option.value === fieldUid)?.model)
+    .filter((model) => supportsLimitOptions(model))
+    .filter(Boolean);
+
+  const options = selected.flatMap((model) => getFieldModelOptions(model, t));
+  const deduped = new Map<string, any>();
+  options.forEach((option) => {
+    deduped.set(JSON.stringify(option?.value), option);
+  });
+  return Array.from(deduped.values());
+};
+
+const getFieldStateProps = (state: string, selectedOptions?: any[]) => {
+  switch (state) {
+    case 'visible':
+      return { hiddenModel: false };
+    case 'hidden':
+      return { hiddenModel: true };
+    case 'hiddenReservedValue':
+      return { hidden: true };
+    case 'required':
+      return { required: true };
+    case 'notRequired':
+      return { required: false };
+    case 'disabled':
+      return { disabled: true };
+    case 'enabled':
+      return { disabled: false };
+    case 'limitOptions':
+      return Array.isArray(selectedOptions) ? { options: selectedOptions } : {};
+    default:
+      return null;
+  }
+};
+
+const getFieldStateTargetModel = (state: string, model: any) => {
+  return state === 'limitOptions' ? model?.subModels?.field || model : model;
+};
+
+const isFieldOptionsPatch = (props: any) => {
+  return props && typeof props === 'object' && Object.keys(props).length === 1 && Array.isArray(props.options);
+};
+
+const syncFieldOptionsToForks = (model: any, props: any) => {
+  if (!isFieldOptionsPatch(props) || !model?.forks || typeof model.forks.forEach !== 'function') return;
+  model.forks.forEach((fork: any) => {
+    fork?.setProps?.({ options: cloneOptions(props.options) });
+  });
+};
+
+type FieldStateEditorValue = {
+  fields: string[];
+  state?: string;
+  selectedOptions?: any[];
+};
+
+const FieldStateEditor = ({
+  value = { fields: [] } as FieldStateEditorValue,
+  onChange,
+  includeFormStates = true,
+  fieldOptionsGetter = getFormFields,
+}) => {
+  const ctx = useFlowContext();
+  const t = ctx.model.translate.bind(ctx.model);
+
+  const fieldOptions = fieldOptionsGetter(ctx);
+  const selectedFieldModels = (value.fields || [])
+    .map((fieldUid) => fieldOptions.find((option) => option.value === fieldUid)?.model)
+    .filter(Boolean);
+  const canConfigureLimitOptions =
+    selectedFieldModels.length === 1 && selectedFieldModels.every((model: any) => supportsLimitOptions(model));
+  const stateOptions = [
+    { label: t('Visible'), value: 'visible' },
+    { label: t('Hidden'), value: 'hidden' },
+    { label: t('Hidden (reserved value)'), value: 'hiddenReservedValue' },
+    includeFormStates && { label: t('Required'), value: 'required' },
+    includeFormStates && { label: t('Not required'), value: 'notRequired' },
+    includeFormStates && { label: t('Disabled'), value: 'disabled' },
+    includeFormStates && { label: t('Enabled'), value: 'enabled' },
+    includeFormStates && canConfigureLimitOptions && { label: t('Options'), value: 'limitOptions' },
+  ].filter(Boolean);
+  const selectableOptions = getFieldOptionsBySelectedFields(fieldOptions, value.fields, t);
+
+  const handleFieldsChange = (selectedFields: string[]) => {
+    const nextSelectedFieldModels = selectedFields
+      .map((fieldUid) => fieldOptions.find((option) => option.value === fieldUid)?.model)
+      .filter(Boolean);
+    const nextCanConfigureLimitOptions =
+      nextSelectedFieldModels.length === 1 &&
+      nextSelectedFieldModels.every((model: any) => supportsLimitOptions(model));
+    const nextState = value.state === 'limitOptions' && !nextCanConfigureLimitOptions ? undefined : value.state;
+    const nextSelectedOptions =
+      value.state === 'limitOptions' || nextState === 'limitOptions' ? [] : value.selectedOptions;
+    onChange({
+      ...value,
+      fields: selectedFields,
+      state: nextState,
+      selectedOptions: nextSelectedOptions,
+    });
+  };
+
+  const handleStateChange = (selectedState: string) => {
+    onChange({
+      ...value,
+      state: selectedState,
+      selectedOptions: selectedState === 'limitOptions' ? value.selectedOptions || [] : undefined,
+    });
+  };
+
+  const handleSelectedOptionsChange = (selectedValues: any[]) => {
+    onChange({
+      ...value,
+      selectedOptions: selectableOptions.filter((option) => selectedValues.includes(option.value)),
+    });
+  };
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+      <div>
+        <div style={{ marginBottom: '4px', fontSize: '14px' }}>{t('Fields')}</div>
+        <Select
+          mode="multiple"
+          value={value.fields}
+          onChange={handleFieldsChange}
+          placeholder={t('Please select fields')}
+          style={{ width: '100%' }}
+          options={fieldOptions}
+          showSearch
+          // @ts-ignore
+          filterOption={(input, option) => (option?.label ?? '').toLowerCase().includes(input.toLowerCase())}
+          allowClear
+        />
+      </div>
+      <div>
+        <div style={{ marginBottom: '4px', fontSize: '14px' }}>{t('State')}</div>
+        <Select
+          value={value.state}
+          onChange={handleStateChange}
+          placeholder={t('Please select state')}
+          style={{ width: '100%' }}
+          options={stateOptions}
+          allowClear
+        />
+      </div>
+      {value.state === 'limitOptions' && canConfigureLimitOptions && (
+        <div>
+          <div style={{ marginBottom: '4px', fontSize: '14px' }}>{t('Options')}</div>
+          <Select
+            mode="multiple"
+            value={(value.selectedOptions || []).map((option: any) => option.value)}
+            onChange={handleSelectedOptionsChange}
+            style={{ width: '100%' }}
+            options={selectableOptions}
+            showSearch
+            // @ts-ignore
+            filterOption={(input, option) => (option?.label ?? '').toLowerCase().includes(input.toLowerCase())}
+            allowClear
+          />
+        </div>
+      )}
+    </div>
+  );
 };
 
 const getFormFieldsByForkModel = (ctx: any) => {
@@ -488,68 +697,7 @@ export const linkageSetFieldProps = defineAction({
     value: {
       type: 'object',
       'x-component': (props) => {
-        const { value = { fields: [] }, onChange } = props;
-        // eslint-disable-next-line react-hooks/rules-of-hooks
-        const ctx = useFlowContext();
-        const t = ctx.model.translate.bind(ctx.model);
-
-        const fieldOptions = getFormFields(ctx);
-
-        // 状态选项
-        const stateOptions = [
-          { label: t('Visible'), value: 'visible' },
-          { label: t('Hidden'), value: 'hidden' },
-          { label: t('Hidden (reserved value)'), value: 'hiddenReservedValue' },
-          { label: t('Required'), value: 'required' },
-          { label: t('Not required'), value: 'notRequired' },
-          { label: t('Disabled'), value: 'disabled' },
-          { label: t('Enabled'), value: 'enabled' },
-        ];
-
-        const handleFieldsChange = (selectedFields: string[]) => {
-          onChange({
-            ...value,
-            fields: selectedFields,
-          });
-        };
-
-        const handleStateChange = (selectedState: string) => {
-          onChange({
-            ...value,
-            state: selectedState,
-          });
-        };
-
-        return (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
-            <div>
-              <div style={{ marginBottom: '4px', fontSize: '14px' }}>{t('Fields')}</div>
-              <Select
-                mode="multiple"
-                value={value.fields}
-                onChange={handleFieldsChange}
-                placeholder={t('Please select fields')}
-                style={{ width: '100%' }}
-                options={fieldOptions}
-                showSearch
-                // @ts-ignore
-                filterOption={(input, option) => (option?.label ?? '').toLowerCase().includes(input.toLowerCase())}
-                allowClear
-              />
-            </div>
-            <div>
-              <div style={{ marginBottom: '4px', fontSize: '14px' }}>{t('State')}</div>
-              <Select
-                value={value.state}
-                onChange={handleStateChange}
-                placeholder={t('Please select state')}
-                style={{ width: '100%' }}
-                options={stateOptions}
-                allowClear
-              />
-            </div>
-          </div>
-        );
+        return <FieldStateEditor {...props} />;
       },
     },
   },
@@ -567,36 +715,13 @@ export const linkageSetFieldProps = defineAction({
         const fieldModel = gridModels.find((model: any) => model.uid === fieldUid);
 
         if (fieldModel) {
-          let props: any = {};
-
-          switch (state) {
-            case 'visible':
-              props = { hiddenModel: false };
-              break;
-            case 'hidden':
-              props = { hiddenModel: true };
-              break;
-            case 'hiddenReservedValue':
-              props = { hidden: true };
-              break;
-            case 'required':
-              props = { required: true };
-              break;
-            case 'notRequired':
-              props = { required: false };
-              break;
-            case 'disabled':
-              props = { disabled: true };
-              break;
-            case 'enabled':
-              props = { disabled: false };
-              break;
-            default:
-              console.warn(`Unknown state: ${state}`);
-              return;
+          const props = getFieldStateProps(state, value?.selectedOptions);
+          if (!props) {
+            console.warn(`Unknown state: ${state}`);
+            return;
           }
 
-          setProps(fieldModel as FlowModel, props);
+          setProps(getFieldStateTargetModel(state, fieldModel) as FlowModel, props);
         }
       } catch (error) {
         console.warn(`Failed to set props for field ${fieldUid}:`, error);
@@ -614,68 +739,7 @@ export const subFormLinkageSetFieldProps = defineAction({
     value: {
       type: 'object',
       'x-component': (props) => {
-        const { value = { fields: [] }, onChange } = props;
-        // eslint-disable-next-line react-hooks/rules-of-hooks
-        const ctx = useFlowContext();
-        const t = ctx.model.translate.bind(ctx.model);
-
-        const fieldOptions = getFormFieldsByForkModel(ctx);
-
-        // 状态选项
-        const stateOptions = [
-          { label: t('Visible'), value: 'visible' },
-          { label: t('Hidden'), value: 'hidden' },
-          { label: t('Hidden (reserved value)'), value: 'hiddenReservedValue' },
-          { label: t('Required'), value: 'required' },
-          { label: t('Not required'), value: 'notRequired' },
-          { label: t('Disabled'), value: 'disabled' },
-          { label: t('Enabled'), value: 'enabled' },
-        ];
-
-        const handleFieldsChange = (selectedFields: string[]) => {
-          onChange({
-            ...value,
-            fields: selectedFields,
-          });
-        };
-
-        const handleStateChange = (selectedState: string) => {
-          onChange({
-            ...value,
-            state: selectedState,
-          });
-        };
-
-        return (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
-            <div>
-              <div style={{ marginBottom: '4px', fontSize: '14px' }}>{t('Fields')}</div>
-              <Select
-                mode="multiple"
-                value={value.fields}
-                onChange={handleFieldsChange}
-                placeholder={t('Please select fields')}
-                style={{ width: '100%' }}
-                options={fieldOptions}
-                showSearch
-                // @ts-ignore
-                filterOption={(input, option) => (option?.label ?? '').toLowerCase().includes(input.toLowerCase())}
-                allowClear
-              />
-            </div>
-            <div>
-              <div style={{ marginBottom: '4px', fontSize: '14px' }}>{t('State')}</div>
-              <Select
-                value={value.state}
-                onChange={handleStateChange}
-                placeholder={t('Please select state')}
-                style={{ width: '100%' }}
-                options={stateOptions}
-                allowClear
-              />
-            </div>
-          </div>
-        );
+        return <FieldStateEditor {...props} fieldOptionsGetter={getFormFieldsByForkModel} />;
       },
     },
   },
@@ -713,36 +777,13 @@ export const subFormLinkageSetFieldProps = defineAction({
         }
 
         if (model) {
-          let props: any = {};
-
-          switch (state) {
-            case 'visible':
-              props = { hiddenModel: false };
-              break;
-            case 'hidden':
-              props = { hiddenModel: true };
-              break;
-            case 'hiddenReservedValue':
-              props = { hidden: true };
-              break;
-            case 'required':
-              props = { required: true };
-              break;
-            case 'notRequired':
-              props = { required: false };
-              break;
-            case 'disabled':
-              props = { disabled: true };
-              break;
-            case 'enabled':
-              props = { disabled: false };
-              break;
-            default:
-              console.warn(`Unknown state: ${state}`);
-              return;
+          const props = getFieldStateProps(state, value?.selectedOptions);
+          if (!props) {
+            console.warn(`Unknown state: ${state}`);
+            return;
           }
 
-          setProps(model as FlowModel, props);
+          setProps(getFieldStateTargetModel(state, model) as FlowModel, props);
         }
       } catch (error) {
         console.warn(`Failed to set props for field ${fieldUid}:`, error);
@@ -760,64 +801,7 @@ export const linkageSetDetailsFieldProps = defineAction({
     value: {
       type: 'object',
       'x-component': (props) => {
-        const { value = { fields: [] }, onChange } = props;
-        // eslint-disable-next-line react-hooks/rules-of-hooks
-        const ctx = useFlowContext();
-        const t = ctx.model.translate.bind(ctx.model);
-
-        const fieldOptions = getFormFields(ctx);
-
-        // 状态选项
-        const stateOptions = [
-          { label: t('Visible'), value: 'visible' },
-          { label: t('Hidden'), value: 'hidden' },
-          { label: t('Hidden (reserved value)'), value: 'hiddenReservedValue' },
-        ];
-
-        const handleFieldsChange = (selectedFields: string[]) => {
-          onChange({
-            ...value,
-            fields: selectedFields,
-          });
-        };
-
-        const handleStateChange = (selectedState: string) => {
-          onChange({
-            ...value,
-            state: selectedState,
-          });
-        };
-
-        return (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
-            <div>
-              <div style={{ marginBottom: '4px', fontSize: '14px' }}>{t('Fields')}</div>
-              <Select
-                mode="multiple"
-                value={value.fields}
-                onChange={handleFieldsChange}
-                placeholder={t('Please select fields')}
-                style={{ width: '100%' }}
-                options={fieldOptions}
-                showSearch
-                // @ts-ignore
-                filterOption={(input, option) => (option?.label ?? '').toLowerCase().includes(input.toLowerCase())}
-                allowClear
-              />
-            </div>
-            <div>
-              <div style={{ marginBottom: '4px', fontSize: '14px' }}>{t('State')}</div>
-              <Select
-                value={value.state}
-                onChange={handleStateChange}
-                placeholder={t('Please select state')}
-                style={{ width: '100%' }}
-                options={stateOptions}
-                allowClear
-              />
-            </div>
-          </div>
-        );
+        return <FieldStateEditor {...props} includeFormStates={false} />;
       },
     },
   },
@@ -835,24 +819,13 @@ export const linkageSetDetailsFieldProps = defineAction({
         const fieldModel = gridModels.find((model: any) => model.uid === fieldUid);
 
         if (fieldModel) {
-          let props: any = {};
-
-          switch (state) {
-            case 'visible':
-              props = { hiddenModel: false };
-              break;
-            case 'hidden':
-              props = { hiddenModel: true };
-              break;
-            case 'hiddenReservedValue':
-              props = { hidden: true };
-              break;
-            default:
-              console.warn(`Unknown state: ${state}`);
-              return;
+          const props = getFieldStateProps(state);
+          if (!props) {
+            console.warn(`Unknown state: ${state}`);
+            return;
           }
 
-          setProps(fieldModel as FlowModel, props);
+          setProps(getFieldStateTargetModel(state, fieldModel) as FlowModel, props);
         }
       } catch (error) {
         console.warn(`Failed to set props for field ${fieldUid}:`, error);
@@ -1907,6 +1880,120 @@ const commonLinkageRulesHandler = async (ctx: FlowContext, params: any) => {
 
     return null;
   };
+  const normalizeNamePathForKey = (namePath: any): Array<string | number> | null => {
+    if (!Array.isArray(namePath) || !namePath.length) return null;
+    const normalized = namePath.filter((seg) => typeof seg === 'string' || typeof seg === 'number') as Array<
+      string | number
+    >;
+    return normalized.length ? normalized : null;
+  };
+  const getFieldIndexEntries = (fieldIndex: any): Array<{ name: string; index: number }> => {
+    if (!Array.isArray(fieldIndex)) return [];
+    return fieldIndex
+      .map((entry) => {
+        if (typeof entry !== 'string') return null;
+        const [name, indexText] = entry.split(':');
+        const index = Number(indexText);
+        if (!name || !Number.isFinite(index)) return null;
+        return { name, index };
+      })
+      .filter(Boolean) as Array<{ name: string; index: number }>;
+  };
+  const resolveIndexedRelativePath = (path: string, fieldIndex: any): Array<string | number> | null => {
+    const pathSegs = parsePathString(path).filter((seg) => typeof seg === 'string' || typeof seg === 'number') as Array<
+      string | number
+    >;
+    if (!pathSegs.length) return null;
+
+    const entries = getFieldIndexEntries(fieldIndex);
+    if (!entries.length) return null;
+
+    const firstSeg = typeof pathSegs[0] === 'string' ? pathSegs[0] : '';
+    const matchedEntryIndex = firstSeg ? entries.findIndex((entry) => entry.name === firstSeg) : -1;
+    const prefixEntries = matchedEntryIndex >= 0 ? entries.slice(0, matchedEntryIndex) : entries;
+    const remainingEntries = matchedEntryIndex >= 0 ? entries.slice(matchedEntryIndex) : [];
+    const out: Array<string | number> = [];
+
+    prefixEntries.forEach((entry) => {
+      out.push(entry.name, entry.index);
+    });
+
+    let entryIndex = 0;
+    pathSegs.forEach((seg, index) => {
+      out.push(seg);
+      const entry = remainingEntries[entryIndex];
+      if (typeof seg !== 'string' || !entry || entry.name !== seg) return;
+
+      const nextSeg = pathSegs[index + 1];
+      if (typeof nextSeg === 'number') {
+        entryIndex += 1;
+        return;
+      }
+      out.push(entry.index);
+      entryIndex += 1;
+    });
+
+    return out;
+  };
+  const getModelTargetPathKeys = (model: any): Set<string> => {
+    const keys = new Set<string>();
+    const fieldPathArray = normalizeNamePathForKey(model?.context?.fieldPathArray);
+    if (fieldPathArray) {
+      keys.add(namePathToPathKey(fieldPathArray));
+      return keys;
+    }
+
+    const targetPath = getModelTargetPathForPatch(model);
+    if (targetPath) {
+      const fieldIndexEntries = getFieldIndexEntries(model?.context?.fieldIndex);
+      if (!fieldIndexEntries.length) {
+        keys.add(`raw:${targetPath}`);
+      }
+
+      const resolved = normalizeNamePathForKey(resolveDynamicNamePath(targetPath, model?.context?.fieldIndex));
+      if (resolved) {
+        keys.add(namePathToPathKey(resolved));
+      }
+
+      const indexedRelativePath = resolveIndexedRelativePath(targetPath, model?.context?.fieldIndex);
+      if (indexedRelativePath) {
+        keys.add(namePathToPathKey(indexedRelativePath));
+      }
+    }
+
+    return keys;
+  };
+  const forEachModelIncludingForks = (visitor: (model: any) => void) => {
+    const engine = (ctx as any)?.engine || ctx.model?.flowEngine;
+    if (!engine?.forEachModel) return;
+    engine.forEachModel((model: any) => {
+      visitor(model);
+
+      const forks: any = model?.forks;
+      if (forks && typeof forks.forEach === 'function') {
+        forks.forEach((fork: any) => {
+          if (!fork || fork.disposed) return;
+          visitor(fork);
+        });
+      }
+    });
+  };
+  const syncHiddenStateByTargetPath = (targetModel: any, hidden: boolean) => {
+    const targetPathKeys = getModelTargetPathKeys(targetModel);
+    if (!targetPathKeys.size) return;
+
+    const targetBlockUid = targetModel?.context?.blockModel?.uid;
+    if (!targetBlockUid) return;
+    forEachModelIncludingForks((model: any) => {
+      if (!model || typeof model !== 'object') return;
+      const modelBlockUid = model?.context?.blockModel?.uid;
+      if (String(modelBlockUid) !== String(targetBlockUid)) return;
+      const modelPathKeys = getModelTargetPathKeys(model);
+      if (!Array.from(modelPathKeys).some((key) => targetPathKeys.has(key))) return;
+
+      model.hidden = hidden;
+    });
+  };
 
   // 1. 运行所有的联动规则
   for (const rule of linkageRules.filter((r) => r.enable)) {
@@ -1958,20 +2045,32 @@ const commonLinkageRulesHandler = async (ctx: FlowContext, params: any) => {
       mergedPropsByUid.set(uid, { ...curProps });
     } else {
       // 合并属性：后写覆盖先写；优先选择 fork 模型作为应用目标
-      mergedPropsByUid.set(uid, { ...mergedPropsByUid.get(uid), ...curProps });
+      const prevProps = mergedPropsByUid.get(uid) || {};
+      const nextProps = { ...prevProps, ...curProps };
+      mergedPropsByUid.set(uid, nextProps);
       const exist = mergedByUid.get(uid) as any;
-      if (m.isFork && !exist.isFork) {
+      const hasCurrentPatch = Object.keys(curProps).length > 0;
+      const hasExistingPatch = Object.keys(prevProps).length > 0;
+      if (hasCurrentPatch && (!hasExistingPatch || !m.isFork || !exist.isFork)) {
+        mergedByUid.set(uid, m);
+      } else if (m.isFork && !exist.isFork) {
         mergedByUid.set(uid, m);
       }
     }
   });
 
+  const hiddenStatePatches: Array<{ model: any; hidden: boolean }> = [];
   mergedByUid.forEach((model: any, uid) => {
     const patchProps = mergedPropsByUid.get(uid) || {};
     const newProps = { ...model.__originalProps, ...patchProps };
+    const hasHiddenModelPatch = Object.prototype.hasOwnProperty.call(patchProps, 'hiddenModel');
 
     model.setProps(_.omit(newProps, ['hiddenModel', 'value', 'hiddenText']));
+    syncFieldOptionsToForks(model, patchProps);
     model.hidden = !!newProps.hiddenModel;
+    if (hasHiddenModelPatch) {
+      hiddenStatePatches.push({ model, hidden: model.hidden });
+    }
 
     if (newProps.required === true) {
       const rules = (model.props.rules || []).filter((rule) => !rule.required);
@@ -1989,8 +2088,10 @@ const commonLinkageRulesHandler = async (ctx: FlowContext, params: any) => {
       model.setProps('title', '');
     }
 
-    // 目前只有表单的“字段赋值”有 value 属性
-    if ('value' in newProps && model.context.form) {
+    // 只有本轮联动动作显式写入 value 时，才应执行表单赋值。
+    // 普通字段组件也会由 Form.Item/FieldModelRenderer 注入 value；如果从 __originalProps 继承该值，
+    // limitOptions/disabled 等状态联动会误把当前表单值清空。
+    if (Object.prototype.hasOwnProperty.call(patchProps, 'value') && model.context.form) {
       const targetPath = getModelTargetPathForPatch(model);
       if (!targetPath) {
         console.warn('[linkageRules] Skip linkage assignment due to missing target path', {
@@ -2004,6 +2105,9 @@ const commonLinkageRulesHandler = async (ctx: FlowContext, params: any) => {
     }
 
     model.__props = null;
+  });
+  hiddenStatePatches.forEach(({ model, hidden }) => {
+    syncHiddenStateByTargetPath(model, hidden);
   });
 
   const allPatches = [...directValuePatches];

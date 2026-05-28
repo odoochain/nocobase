@@ -323,6 +323,8 @@ export class TableColumnModel extends DisplayItemModel {
 
 TableColumnModel.define({
   label: tExpr('Display fields'),
+  searchable: true,
+  searchPlaceholder: tExpr('Search fields'),
 });
 
 TableColumnModel.registerFlow({
@@ -445,6 +447,9 @@ TableColumnModel.registerFlow({
     quickEdit: {
       title: tExpr('Enable quick edit'),
       uiMode: { type: 'switch', key: 'editable' },
+      hideInSettings(ctx) {
+        return !!ctx.model.associationPathName;
+      },
       defaultParams(ctx) {
         if (ctx.model.collectionField.readonly || ctx.model.associationPathName) {
           return {
@@ -456,7 +461,7 @@ TableColumnModel.registerFlow({
         };
       },
       handler(ctx, params) {
-        ctx.model.setProps('editable', params.editable);
+        ctx.model.setProps('editable', ctx.model.associationPathName ? false : params.editable);
       },
     },
     model: {
@@ -530,6 +535,9 @@ TableColumnModel.registerFlow({
         } else if (fieldModel) {
           fieldModel.setStepParams('fieldSettings', 'init', fieldSettingsInit);
           await fieldModel.dispatchEvent('beforeRender', undefined, { useCache: false });
+        }
+        if (targetUse) {
+          ctx.model.setStepParams('tableColumnSettings', 'model', { use: targetUse });
         }
         ctx.model.setProps(targetCollectionField.getComponentProps());
       },

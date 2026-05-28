@@ -15,6 +15,16 @@ import React, { useCallback } from 'react';
 import { CONTEXT_TYPE, EVENT_TYPE, NAMESPACE } from '../common/constants';
 import { ContextDataJsonInput } from './components';
 
+const customActionDescription = `{{t('Workflow will be triggered directly once the button clicked, without data saving. Only supports to be bound with "Custom action event".', { ns: "${NAMESPACE}" })}}`;
+
+function matchWorkflowContextType(config?: { type?: number | null } | null, contextType?: number | null) {
+  const configType = config?.type;
+  if (contextType === CONTEXT_TYPE.GLOBAL || contextType == null) {
+    return configType === CONTEXT_TYPE.GLOBAL || configType == null;
+  }
+  return configType === contextType;
+}
+
 export class FormTriggerWorkflowActionModel extends FormActionModel {
   defaultProps: ButtonProps = {
     title: tExpr('Trigger workflow', { ns: NAMESPACE }),
@@ -39,6 +49,7 @@ FormTriggerWorkflowActionModel.registerFlow({
         filter: {
           type: EVENT_TYPE,
         },
+        description: customActionDescription,
         optionFilter({ config }) {
           return config.type === CONTEXT_TYPE.SINGLE_RECORD;
         },
@@ -114,6 +125,7 @@ RecordTriggerWorkflowActionModel.registerFlow({
         filter: {
           type: EVENT_TYPE,
         },
+        description: customActionDescription,
         optionFilter({ config }) {
           return config.type === CONTEXT_TYPE.SINGLE_RECORD;
         },
@@ -187,7 +199,7 @@ function CollectionActionWorkflowSelectComponent({ ...props }) {
   const optionFilter = useCallback(
     ({ config }) => {
       const { type } = model.stepParams.customCollectionTriggerWorkflowsActionSettings.setContextType;
-      return (type && config.type === type) || !config.type;
+      return matchWorkflowContextType(config, type);
     },
     [model.stepParams.customCollectionTriggerWorkflowsActionSettings.setContextType],
   );
@@ -231,14 +243,17 @@ CollectionTriggerWorkflowActionModel.registerFlow({
     triggerWorkflows: {
       title: `{{t('Bind workflows', { ns: 'workflow' })}}`,
       uiSchema: (ctx) => {
+        const { type } = ctx.model.stepParams.customCollectionTriggerWorkflowsActionSettings?.setContextType ?? {};
         const baseSchema = createTriggerWorkflowsSchema({
           WorkflowSelectComponent: CollectionActionWorkflowSelectComponent,
           filter: {
             type: EVENT_TYPE,
           },
           usingContext: false,
+          description: type
+            ? `{{t('Only support custom action workflow with context type set to "Multiple records".', { ns: "${NAMESPACE}" })}}`
+            : `{{t('Only support custom action workflow with context type set to "Custom context".', { ns: "${NAMESPACE}" })}}`,
         })(ctx);
-        const { type } = ctx.model.stepParams.customCollectionTriggerWorkflowsActionSettings?.setContextType ?? {};
         if (!type) {
           return {
             ...baseSchema,
@@ -369,8 +384,9 @@ function globalTriggerWorkflowUiSchema(ctx) {
     filter: {
       type: EVENT_TYPE,
     },
+    description: `{{t('Only support custom action workflow with context type set to "Custom context".', { ns: "${NAMESPACE}" })}}`,
     optionFilter({ config }) {
-      return !config.type;
+      return matchWorkflowContextType(config, CONTEXT_TYPE.GLOBAL);
     },
     usingContext: false,
   })(ctx);
