@@ -47,6 +47,11 @@ server {
         access_log off;
         autoindex off;
 
+        location ~ ^/static/plugins/(?:@[^/]+/)?[^/]+/dist/client/.*\.mjs$ {
+            types { application/javascript mjs; }
+            allow all;
+        }
+
         location ~ ^/static/plugins/@([^/]+)/([^/]+)/dist/client/(.*)$ {
             allow all;
         }
